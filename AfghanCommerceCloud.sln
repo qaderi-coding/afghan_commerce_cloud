@@ -1,0 +1,26 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.10.40513.116
+MinimumVisualStudioVersion = 10.0.40219.1
+
+Project("{88B2A5D4-0B0E-429B-83D2-DC7D8A078508}") = "AfghanCommerceCloud.SharedKernel", "src\SharedKernel\SharedKernel.csproj", "{00000000-0000-0000-0000-000000000001}"
+EndProject
+Project("{88B2A5D4-0B0E-429B-83D2-DC7D8A078508}") = "IdentityAccess.Domain", "src\IdentityAccess\IdentityAccess.Domain\IdentityAccess.Domain.csproj", "{00000000-0000-0000-0000-000000000002}"
+EndProject
+Project("{88B2A5D4-0B0E-429B-83D2-DC7D8A078508}") = "IdentityAccess.Application", "src\IdentityAccess\IdentityAccess.Application\IdentityAccess.Application.csproj", "{00000000-0000-0000-0000-000000000003}"
+EndProject
+Project("{88B2A5D4-0B0E-429B-83D2-DC7D8A078508}") = "IdentityAccess.Infrastructure", "src\IdentityAccess\IdentityAccess.Infrastructure\IdentityAccess.Infrastructure.csproj", "{00000000-0000-0000-0000-000000000004}"
+EndProject
+Project("{88B2A5D4-0B0E-429B-83D2-DC7D8A078508}") = "IdentityAccess.API", "src\IdentityAccess\IdentityAccess.API\IdentityAccess.API.csproj", "{00000000-0000-0000-0000-000000000005}"
+EndProject
+Project("{88B2A5D4-0B0E-429B-83D2-DC7D8A078508}") = "UnitTests", "tests\UnitTests\UnitTests.csproj", "{00000000-0000-0000-0000-000000000006}"
+EndProject
+Project("{88B2A5D4-0B0E-429B-83D2-DC7D8A078508}") = "IntegrationTests", "tests\IntegrationTests\IntegrationTests.csproj", "{00000000-0000-0000-0000-000000000007}"
+EndProject
+
+Global
+    GlobalSection(SolutionConfigurationPlatforms) = preSolution
+        Debug|Any CPU = Debug|Any CPU
+        Release|Any CPU = Release|Any CPU
+    EndGlobalSection
+EndGlobal
