@@ -1,11 +1,7 @@
+// This project has been consolidated into API.Gateway
+// Identity endpoints are now available at /api/auth in API.Gateway
+
 var builder = WebApplication.CreateBuilder(args);
-
-builder.Services.AddGraphQLServer();
-
 var app = builder.Build();
-
-app.MapGraphQL();
-
-app.MapGet("/health", () => "Afghan Commerce Cloud Identity Access API is running");
-
+app.MapGet("/health", () => "IdentityAccess module consolidated - use API.Gateway");
 app.Run();

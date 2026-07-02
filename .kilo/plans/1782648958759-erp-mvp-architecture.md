@@ -2,8 +2,8 @@
 
 ## 0. Constraints & Stack
 
-- Backend: .NET 8 Web API + GraphQL (HotChocolate) (HotChocolate), Clean Architecture, Modular Monolith
-- Frontend: React 18 + TypeScript + Vite + MUI + Apollo Client
+- Backend: .NET 8 Web API + REST, Clean Architecture, Modular Monolith
+- Frontend: React 18 + TypeScript + Vite + MUI + React Query
 - Database: MariaDB (EF Core Pomelo provider) — use existing `database-backup.sql` as source of truth
 - Infra: Docker, Redis, Nginx, GitHub Actions, Serilog + OpenTelemetry
 - Currency: AFN base, USD active, multi-currency amounts stored as decimal + code
@@ -54,8 +54,8 @@
 | 35 | stocksaleitems | Invoice lines | Yes |
 | 36 | stocksalebillcosts | Sales-side costs | Yes |
 | 37 | stocksaleexcashes | Cash split per sale | Yes |
-| 38 | stockpossales | POS fast sales | Yes |
-| 39 | stockpossaleitems | POS sale lines | Yes |
+| 38 | stockpossales | Fast sales / quick invoices | Yes |
+| 39 | stockpossaleitems | Fast sale lines | Yes |
 | 40 | stocktransfers | Inter-location stock movement | Later |
 | 41 | stocktransferitems | Transfer lines | Later |
 | 42 | stocktransfercosts | Transfer-side costs | Later |
@@ -138,7 +138,7 @@
 | stockpurchasecosts | Extra costs (e.g. freight) | journalId, cashAccountId | `double` → `decimal` |
 | stockpurchasecloses | Purchase closure / finalization | stockPurchaseId, journalId | — |
 
-### 1.5 Sales / POS
+### 1.5 Sales / Invoicing
 
 | Table | Purpose | Key FKs | Issues |
 |-------|---------|---------|--------|
@@ -146,8 +146,8 @@
 | stocksaleitems | Invoice lines | stockSaleId, stockItemId, stockAccountId | `double` → `decimal` |
 | stocksalebillcosts | Sales-side costs (e.g. delivery) | stockSaleId, cashAccountId | — |
 | stocksaleexcashes | Cash split per sale (AFN/USD) | stockSaleId | Replace with `cashreceipts` linkage |
-| stockpossales | POS fast sales | customerAccountId → accounts, cashAccountId, stockAccountId | `customer` varchar(255) → FK to accounts |
-| stockpossaleitems | POS sale lines | stockPOSSaleId, stockItemId | `double` → `decimal` |
+| stockpossales | Fast sales / quick invoices | customerAccountId → accounts, cashAccountId, stockAccountId | `customer` varchar(255) → FK to accounts |
+| stockpossaleitems | Fast sale lines | stockPOSSaleId, stockItemId | `double` → `decimal` |
 
 ### 1.6 Transfers & Exchanges
 
@@ -244,17 +244,19 @@
 - Partial receipt updates stocklevels + creates sub-journal
 - Bill costs allocated across items by ratio or weight
 
-### 2.4 Sales / POS Context
+### 2.4 Sales / Billing Context
 
-**Aggregates:** StockSale, StockPOSSale
-**Entities:** StockSaleItem, StockPOSSaleItem, StockSaleExCash, WalkInCustomer
-**Value Objects:** PaymentType(cash|credit|partial), CustomerLookup
-**Domain Services:** SalePriceValidator, COGSCalculator, CashSplitter
+**Aggregates:** StockSale, StockPOSSale, CreditNote
+**Entities:** StockSaleItem, StockPOSSaleItem, StockSaleExCash, WalkInCustomer, CreditNoteItem
+**Value Objects:** PaymentType(cash|credit|partial), CustomerLookup, InvoiceNumber, CreditNoteNumber
+**Domain Services:** SalePriceValidator, COGSCalculator, CashSplitter, SalesReturnProcessor
 **Rules:**
-- POS sale auto-generates cash receipt + revenue + COGS + stock journals
-- `stockPOSSaleId` links to `cashreceipts.journalId` for traceability
+- Sales invoice auto-generates cash receipt + revenue + COGS + stock journals
+- `stockSaleId` links to `cashreceipts.journalId` for traceability
 - Customer free-text stored only if not found in accounts under same session
 - Partial payment: remaining → A/R account
+- Credit note references original sale; restores stock + reverses revenue/COGS
+- Refund path: create cash payment or customer credit
 
 ### 2.5 Accounting Context
 
@@ -292,36 +294,41 @@
 
 ## 3. End-to-End Business Flows
 
-### 3.1 POS Sale Flow
+### 3.1 Sales Invoice Flow
 
 ```
-Customer selection (account search by name/phone)
+Customer selection (account search by name/phone, subType='customer')
   ↓
-Cart assembly (scan barcode or search stockitems)
+Invoice assembly:
+  - Select stockitems (scan barcode or search)
+  - Enter qty, unit price per line
+  - Add delivery costs if any (stocksalebillcosts)
+  - paymentType = cash|credit|partial
   ↓
-Cart validations:
+Validation:
   - qty > 0
   - stock available (or allowNegativeStock)
   - price editable iff user.allowPriceEditing
   ↓
-Checksout:
+Submit:
   1. BeginTransaction (ambient, cross-module)
-  2. Create Journal(type=stockPOSSale, fpId=current)
-  3. Post Cash Transactions:
-     - Dr CashAccount (total)
+  2. Create Journal(type=stockSale, fpId=current)
+  3. Post A/R Entry:
+     - Dr CustomerAccount (A/R) (total)
      - Cr RevenueAccount (total - discount)
-     - If discount: Dr DiscountExpense / Cr CashAccount (discount portion)
+     - If discount: Dr DiscountExpense / Cr CustomerAccount (discount portion)
   4. Post COGS + Stock:
      - Dr COGSAccount (sum of avg cost * qty)
      - Cr StockAccount (same amount)
   5. Decrease StockLevels (-qty)
-  6. Create StockPOSSale + StockPOSSaleItems
-  7. Create CashReceipt (linked to journal)
-  8. Create CashReceiptItems (AFN/USD split if needed)
-  9. Create StockSaleExCash (if multi-currency tendered)
- 10. CommitTransaction
- 11. Publish StockUpdated event → Redis invalidation
- 12. Emit AuditLog(userId, action='pos_sale', refType='StockPOSSale', refId)
+  6. Create StockSale + StockSaleItems
+  7. Create StockSaleBillCosts (if any)
+  8. If cash/partial: Create CashReceipt (linked to journal)
+  9. Create CashReceiptItems (AFN/USD split if needed)
+ 10. If stockSaleExCash needed: create stockSaleExCash
+ 11. CommitTransaction
+ 12. Publish StockUpdated event → Redis invalidation
+ 13. Emit AuditLog(userId, action='sale_invoice', refType='StockSale', refId)
 ```
 
 ### 3.2 Purchase Flow
@@ -372,7 +379,73 @@ Validate:
 7. AuditLog
 ```
 
-### 3.4 Cash Receipt (Customer Payment)
+### 3.4 Sales Return Flow (Credit Note)
+
+```
+Select original StockSale to return against
+  ↓
+Return entry:
+  - Select stockitems + qty to return (must be ≤ original qty)
+  - Reason (damaged, wrong item, customer dissatisfaction)
+  - Refund method (cash, credit memo, future offset)
+  - Restocking fee (optional, configurable)
+  ↓
+Validation:
+  - relatedSaleId must exist and be posted
+  - qty > 0 and qty ≤ original qty
+  - Financial period open
+  ↓
+Submit:
+  1. BeginTransaction
+  2. Create Journal(type=salesReturn, fpId=current)
+  3. Post Stock Restoration:
+     - Dr StockAccount (avg cost * return qty)
+     - Cr COGSAccount (same amount)
+  4. Post Revenue Reversal:
+     - If full return: Dr RevenueAccount, Cr CustomerAccount (A/R)
+     - If partial: reverse proportionally
+     - If restocking fee: Dr CashAccount, Cr RevenueAccount (fee)
+  5. Increase StockLevels (+return qty, update average cost)
+  6. Create CreditNote + CreditNoteItems
+  7. If refund=cash: Create CashPayment (linked to creditnote)
+  8. If refund=creditMemo: update customer balance via cashreceipt offset or account category
+  9. CommitTransaction
+ 10. AuditLog
+```
+
+### 3.5 Purchase Return Flow (Vendor Return)
+
+```
+Select original StockPurchase to return against
+  ↓
+Return entry:
+  - Select stockitems + qty to return (must be ≤ received qty)
+  - Reason (defective, wrong item, excess)
+  - Return type: refund (money back) or creditMemo (vendor credit)
+  ↓
+Validation:
+  - relatedPurchaseId must exist and be closed/received
+  - qty > 0 and qty ≤ received qty
+  - qty must still be in stock if physical return
+  ↓
+Submit:
+  1. BeginTransaction
+  2. Create Journal(type=purchaseReturn, fpId=current)
+  3. Post Stock Removal:
+     - Dr COGS / ExpenseAccount (avg cost * return qty)
+     - Cr StockAccount (same amount)
+  4. Post A/P Reduction:
+     - Dr VendorAccount (A/P) (purchase price * qty)
+     - If refund: Cr CashAccount (or track as vendor receivable)
+     - If creditMemo: Cr VendorAccount net (creates negative A/P = vendor credit)
+  5. Decrease StockLevels (-return qty)
+  6. Create PurchaseReturn + PurchaseReturnItems
+  7. If refund: Create CashPayment
+  8. CommitTransaction
+  9. AuditLog
+```
+
+### 3.6 Cash Receipt (Customer Payment)
 
 ```
 Select customer account (A/R)
@@ -390,7 +463,7 @@ Enter amount + currency + exchange details
 7. AuditLog
 ```
 
-### 3.5 Cash Payment (Vendor Payment)
+### 3.7 Cash Payment (Vendor Payment)
 
 ```
 Select vendor account (A/P)
@@ -407,7 +480,7 @@ Enter amount + currency + exchange details
 6. AuditLog
 ```
 
-### 3.6 Cash Exchange (AFN ↔ USD)
+### 3.8 Cash Exchange (AFN ↔ USD)
 
 ```
 Select from cash account + to cash account
@@ -460,9 +533,9 @@ src/
 │   │   ├── Identity/ (PasswordHasher, JwtTokenService)
 │   │   └── Services/ (PermissionEvaluator)
 │   └── IdentityAccess.API/
-│       ├── GraphQL (Queries/Mutations/Types)/
+│       ├── Controllers/
 │       ├── Middleware/
-│       └── Program.cs (GraphQL server composition)
+│       └── Program.cs (REST API composition)
 ├── Inventory/
 │   └── [same layers: Domain / Application / Infrastructure / API]
 ├── Purchasing/
@@ -531,7 +604,7 @@ public interface IUserContext {
 
 - **Modular Monolith Unit of Work:** `IUnitOfWork` is scoped per HTTP request.
 - **Ambient Transaction:** MediatR pipeline behavior opens `IDbContextTransaction` at start of command; commits on success, rolls back on failure.
-- **Cross-Aggregate Atomicity:** POS sale uses single transaction across Accounting + Inventory + Cash contexts via same `AppDbContext` (shared DbContext in modular monolith).
+- **Cross-Aggregate Atomicity:** Sales invoice uses single transaction across Accounting + Inventory + Cash contexts via same `AppDbContext` (shared DbContext in modular monolith).
 - **Eventual Consistency:** Non-critical side effects (email, SMS, cache invalidation) via `INotification` handlers OUTSIDE the ambient transaction.
 
 ### 4.5 Key Projects Breakdown
@@ -546,8 +619,8 @@ public interface IUserContext {
 | Inventory.Domain | StockItem, StockLevel, UoM, StockAdjustment |
 | Inventory.Application | CRUD, stock queries, barcode logic |
 | Inventory.Infrastructure | Repositories, stock snapshot denormalization |
-| Sales.Domain | StockSale, StockPOSSale, StockSaleItem, WalkInCustomer |
-| Sales.Application | POS checkout workflow, cart validation |
+| Sales.Domain | StockSale, StockPOSSale, CreditNote, CreditNoteItem |
+| Sales.Application | Invoice checkout, return processing, cart validation |
 | Accounting.Domain | Account, Journal, Transaction, FinancialPeriod |
 | Accounting.Application | Post journal, trial balance, COGS calc |
 | Cash.Domain | CashPayment, CashReceipt, CashExchange, CashTransfer |
@@ -560,88 +633,380 @@ public interface IUserContext {
 
 ---
 
-## 5. Frontend Architecture (React + TypeScript + Vite)
+## 5. Frontend Architecture (Enterprise React + TypeScript + Vite)
 
-### 5.1 Folder Structure
+### 5.1 Technology Stack & Rationale
 
-```
-src/
-├── app/
-│   ├── layout.tsx (root with providers)
-│   ├── router.tsx (React Router v7)
-│   └── store.ts (Zustand for UI-only state)
-├── features/
-│   ├── auth/
-│   │   ├── components/ (LoginForm, ProtectedRoute)
-│   │   ├── hooks/ (useAuth)
-│   │   ├── api/ (authApi)
-│   │   └── types/
-│   ├── pos/
-│   │   ├── components/ (Cart, ProductSearch, BarcodeScanner, CheckoutDrawer)
-│   │   ├── pages/ (POSPage)
-│   │   ├── hooks/ (usePOSCart, useBarcodeScanner)
-│   │   ├── api/ (posApi)
-│   │   └── store/ (cartSlice)
-│   ├── inventory/
-│   │   ├── components/ (StockTable, StockAdjustmentDialog)
-│   │   ├── pages/ (InventoryPage, StockItemDetailPage)
-│   │   ├── api/ (inventoryApi)
-│   │   └── types/
-│   ├── purchasing/
-│   │   ├── components/ (PurchaseForm, PurchaseList, BillCostTable)
-│   │   ├── pages/ (PurchasesPage, PurchaseDetailPage)
-│   │   └── api/
-│   ├── sales/
-│   ├── accounting/
-│   ├── cash/
-│   └── payroll/
-├── shared/
-│   ├── components/ (AppShell, Sidebar, DataTable, CurrencyInput)
-│   ├── hooks/ (useReactQuery, useDebounce, useMediaQuery)
-│   ├── lib/ (apolloClient, queryClient, auth)
-│   ├── types/ (Money, JournalEntry, StockItem)
-│   └── utils/ (formatMoney, currencySymbols, dateHelpers)
-└── main.tsx
-```
+| Concern | Choice | Rationale |
+|---------|--------|-----------|
+| Framework | React 18 + TypeScript + Vite | Fast dev server, HMR, enterprise standard |
+| Component Library | MUI v6 + MUI X DataGrid Pro/Advanced | Enterprise grid power; Excel-like editing with Microsoft-inspired themeability |
+| Forms | React Hook Form + Zod | Performance (uncontrolled + TS inference), smaller bundle than Formik, optimal for AI codegen |
+| Server State | TanStack Query v5 | Caching, background refetch, optimistic updates, devtools |
+| Client State | Redux Toolkit + RTK | See §5.2; best for large ERP with undo/redo, draft persistence, wizard state |
+| Routing | React Router v7 | Data routers, type-safe params, nested routes for master-detail |
+| Validation | Zod (shared with backend schemas) | Single source of truth; TS-first; AI-friendly |
+| HTTP Client | Axios + TanStack Query | Interceptors for auth, retry, structured logging |
+| Theming | MUI emotion theme + CssBaseline | Microsoft enterprise aesthetic (Dynamics 365 / Azure Portal density) |
+| i18n | react-i18next | Lazy-loaded locales, namespace per module |
+| Testing | Vitest + React Testing Library + Playwright | Fast unit tests, accessible component tests, E2E for critical paths |
+| Code Quality | ESLint + Prettier + Husky + lint-staged | Enforced standards; AI agents emit consistent code |
+| Build | Vite + Rollup | Tree-shaking, chunk splitting, env-based config |
 
-### 5.2 State Strategy
+### 5.2 Client State Management: Redux Toolkit (Recommended)
 
-| State | Tool | Scope |
-|-------|------|-------|
-| Server data | React Query v5 | All domain entities (cache, invalidation, optimistic updates) |
-| POS cart | Zustand | Ephemeral checkout state |
-| Auth | React Context + React Query | User, permissions, token |
-| UI (dialogs, filters, theme) | Zustand | Transient UI state |
+**Decision: Redux Toolkit + RTK** for client-only global state.
 
-### 5.3 API Layer
+Why Redux Toolkit over Zustand for this ERP:
+- **Scalability:** Single source of truth with normalized state (entities by ID), time-travel debugging, and Redux DevTools — essential for debugging complex invoice/purchase state across 20+ tables.
+- **Maintainability:** Enforced patterns (`createSlice`, `createAsyncThunk`), immutability, and middleware for logging/undo. AI agents generate predictable Redux code because the surface area is well-documented.
+- **Performance:** Selector memoization (`createSelector`) prevents re-renders in dense DataGrids. Granular subscriptions matter when a single invoice has 50 line items.
+- **AI-assisted development:** Strongly typed state, established file conventions (`features/X/slice.ts`), and abundant training data make Redux the safest bet for AI codegen at scale.
 
+**State split:**
+- **TanStack Query:** All server-derived data — entities, lists, lookup options, audit logs.
+- **Redux Toolkit:** Client-only state — active wizard steps, undo/redo stacks for invoice/purchase entry, draft auto-save, UI theme/compactness settings, notification queue, print preview state.
+- **React Hook Form:** Form values and field-level validation — invoices, returns, adjustments. Do NOT lift form state into Redux.
+
+### 5.3 Microsoft-Inspired Enterprise Theme
+
+Target: Dynamics 365 / Azure Portal / Office aesthetic — clean, high-density, command-bar-driven.
+
+Key styling rules:
+- **Density:** Compact by default (`density: -2` in MUI). Minimal padding, smaller touch targets for desktop-only users.
+- **Command Bar:** Top-of-page action bar with icon buttons (Save, Submit, Void, Print, Export) matching Office ribbon behavior.
+- **Typography:** Segoe UI / system font stack. No rounded corners or shadows on data surfaces. Flat or 1px borders.
+- **Color:** Minimal accent color (blue `#0078d4` equivalent). Status via font weight and subtle left-border indicators, not colored pills.
+- **Navigation:** Left sidebar with icon + text; top breadcrumb; tab-based detail panes.
+- **Forms:** No floating labels. Standard top-aligned labels with right-aligned text. Inline validation messages below fields.
+- **Data Grids:** Frozen first column (actions), alternating row tint optional off, grid lines at 1px `divider` color.
+
+### 5.4 Reusable Forms Framework
+
+**Core components:**
+- `ErpForm` — wrapper around `react-hook-form` + ` zodResolver`
+- `FormSection` — collapsible grouped fields with section header
+- `FormField` — label, input, error message, help text; supports `TextField`, `Select`, `DatePicker`, `CurrencyInput`, `LookupSearch`
+- `LookupSearch` — autocomplete against TanStack Query cache; debounced search; keyboard arrow selection; FAB/magnifying-glass trigger
+- `CurrencyInput` — AFN/USD toggle; base-AFN equivalent shown; validates 4 decimals
+- `DynamicTable` — form-driven mini grid for line items (invoice lines). Uses `react-hook-form` + `useFieldArray` + `MUI X DataGrid` under the hood. Supports add/remove/reorder.
+
+**Validation strategy:**
+- Zod schemas co-located with domain types in `shared/contracts`.
+- Server-side validation errors mapped to field-level via `FormField` error prop.
+- Client-side: required, min/max qty, date range, balance checks.
+- Cross-field validation (e.g., credit total ≤ A/R limit) via `zod.refine`.
+
+**Lookup controls:**
+- All customer/vendor/stockitem lookups use `LookupSearch`.
+- Debounced query against `/api/accounting/accounts?q=...&subType=customer`.
+- Results cached by TanStack Query; staleTime 5 min for static lookups.
+- Create-new flow: "Not found? Create account" opens `AccountDialog` pre-filtered by subType.
+
+### 5.5 Reusable Tables Framework
+
+**Core wrappers over MUI X DataGrid Pro/Advanced:**
+
+| Component | Purpose |
+|-----------|---------|
+| `ErpDataGrid` | Base grid: column defs, server-side sort/filter/pag, loading, empty state, export (CSV/XLSX), print |
+| `EditableDataGrid` | Inline editing per cell; optimistic save; rollback on error; dirty indicators |
+| `MasterDetailDataGrid` | Expandable rows: master header + child line items (e.g., StockSale → StockSaleItems) |
+| `SelectionDataGrid` | Checkbox column; bulk actions bar (Void, Export, Print) |
+| `CurrencyColumn` | Right-aligned, 4 decimals, AFN/USD color hint, edit renderer |
+| `StatusColumn` | Pill-free: colored left border + bold text (e.g., Posted / Draft / Returned) |
+
+**Enterprise table capabilities:**
+- Server-side pagination, sorting, filtering via TanStack Query `keepPreviousData`
+- Column management: pin, hide, resize, reorder persisted to `localStorage` per user
+- Export: CSV via `@mui/x-data-grid-pro` export; XLSX via `xlsx` for multi-sheet reports
+- Print: `@react-pdf/renderer` or print-specific CSS media query with page breaks
+- Inline editing: double-click or Enter; Tab to next cell; Esc to cancel; dirty row highlight
+- Keyboard: Excel-style navigation (arrows, Enter, Tab, F2) enabled by default
+- Virtualization: `--mui-x-charts-height` container virtualization for 1000+ rows
+- Density toggle: Compact / Standard / Comfortable (persisted in Redux)
+
+### 5.6 API Layer & Server State
+
+**API client (`shared/lib/apiClient.ts`):**
 ```typescript
-// shared/lib/apolloClient.ts
-export const api = axios.create({ baseURL: '/api' });
+export const api = axios.create({ baseURL: '/api', timeout: 30_000 });
 api.interceptors.request.use((cfg) => {
   const token = getToken();
   if (token) cfg.headers.Authorization = `Bearer ${token}`;
   return cfg;
 });
+api.interceptors.response.use((res) => res, (err) => {
+  if (err.response?.status === 401) { /* redirect login */ }
+  return Promise.reject(err);
+});
 ```
 
-```typescript
-// features/pos/api/posApi.ts
-export const posApi = {
-  searchProducts: (q: string) => api.get<StockItem[]>('/api/inventory/items', { params: { q } }),
-  getStockLevel: (id: string) => api.get<StockLevel>(`/api/inventory/items/${id}/stock`),
-  checkout: (dto: CheckoutDTO) => api.post('/api/pos/checkout', dto),
-  searchAccounts: (q: string) => api.get<Account[]>('/api/accounting/accounts', { params: { q } }),
-};
+**Feature API modules (`features/*/api/*Api.ts`):**
+- All endpoints typed with DTOs from `shared/contracts`.
+- Direct TanStack Query usage in hooks (`features/*/hooks/*.ts`).
+- Cache keys: `['sales', 'invoices', { customerId, fpId, status }]` etc.
+
+**Query patterns:**
+- List queries: `useQuery` + `keepPreviousData` for pagination
+- Detail queries: `useQuery` with `enabled: !!id`
+- Mutations: `useMutation` → invalidate affected lists → toast
+- Optimistic updates: invoice/purchase submit updates list cache immediately
+
+### 5.7 Project Structure (AI-Agent Friendly)
+
+```
+src/
+├── app/
+│   ├── layout.tsx          # Providers: Redux, Router, Query, Theme, i18n
+│   ├── router.tsx          # React Router v7 data routers
+│   └── routes.ts           # Route definitions + auth guards
+├── features/               # Vertical slices — each owns its page/component/api/state
+│   ├── auth/
+│   ├── sales/
+│   │   ├── pages/          # InvoicePage, ReturnPage, CreditNotePage
+│   │   ├── components/     # InvoiceForm, InvoiceLinesTable, ReturnDialog
+│   │   ├── api/            # salesApi.ts
+│   │   ├── hooks/          # useInvoice, useReturns
+│   │   └── types/          # sales.types.ts
+│   ├── purchasing/
+│   ├── returns/
+│   ├── inventory/
+│   ├── accounting/
+│   ├── cash/
+│   └── payroll/
+├── shared/
+│   ├── components/         # ErpDataGrid, ErpForm, FormField, LookupSearch...
+│   ├── hooks/              # useDebounce, useMediaQuery, usePrint
+│   ├── lib/                # apiClient, auth, i18n, Redux store config
+│   ├── stores/             # Redux slices (ui.slice, wizard.slice, undo.slice)
+│   ├── contracts/          # Zod schemas + TypeScript types shared with backend
+│   ├── theme/              # MUI theme (enterprise palette, density, typography)
+│   └── utils/              # formatMoney, dateHelpers, exportHelpers
+├── assets/
+├── main.tsx
+└── vite-env.d.ts
 ```
 
-### 5.4 POS Screen UX
+**Rules for AI agents:**
+- Never add UI state to Redux unless it must survive tab navigation or be undoable.
+- Forms stay local to the feature; lift only IDs and totals to Redux.
+- Every `features/X` folder must be independently buildable/testable.
+- Shared components live in `shared/components`, never in `features`.
 
-- **Left:** Product grid + search + barcode input (autofocus on mount)
-- **Right:** Cart (Qty, Price override toggle, line total, remove)
-- **Bottom bar:** Total, discount %, customer selector, payment method (AFN/USD/cash), Pay button
-- **On Pay:** modal for tendered amount + change; success receipt (thermal ready)
-- **Barcode scanner:** HID keyboard emulation; Enter key triggers search
+### 5.8 Frontend Development Milestones (M1–M9)
+
+> Each frontend milestone pairs with the backend milestone of the same number.
+> Deliverables are shippable UI increments.
+
+#### M1: Foundation (Weeks 1–2) — "Shared Shell & Auth"
+
+**Goal:** Running app shell, auth flow, and Redux/Query wiring.
+
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Initialize Vite + React + TypeScript | Frontend A | `npm run dev` works; Vitest green |
+| Install MUI v6, MUI X DataGrid Pro, Redux Toolkit, TanStack Query, React Router v7, React Hook Form, Zod | Frontend A | All packages resolve; TypeScript strict mode passes |
+| Create enterprise theme (Microsoft Dynamics-inspired) | Frontend B | Compact density; command bar; Segoe/system font; blue accent |
+| Build `AppShell` with sidebar + command bar + breadcrumb + tab content | Frontend B | Layout responsive; sidebar collapsible; themes toggleable |
+| Implement auth flow (login → JWT → redirect) | Frontend A | Login screen; token in memory + silent refresh; ProtectedRoute |
+| Wire Redux store with UI slice (theme density, sidebar collapsed) | Frontend A | Settings persist to `localStorage`; no prop drilling |
+| Wire TanStack Query `QueryClientProvider` with default options | Frontend A | Devtools enabled; staleTime 30s for lists; retry 1 |
+| `ProtectedRoute` + RBAC integration | Frontend A | Redirects unauthorized; module/action checks from `IUserContext` |
+
+**DoD:**
+- App loads login screen; after auth, shows empty shell with sidebar
+- Redux DevTools shows state tree
+- TanStack Query DevTools shows cache
+- Theme toggle changes density globally
+
+---
+
+#### M2: Inventory UI (Weeks 3–4) — "Tables & Forms Skeleton"
+
+**Goal:** Deliver the first real data module with reusable table/form primitives.
+
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Build `ErpDataGrid` and `EditableDataGrid` wrappers | Frontend B | Server-side sort/filter/pag; loading skeletons; empty state; CSV export |
+| Build `ErpForm` + `FormField` + `LookupSearch` | Frontend A | Validation errors display; lookup debounced; keyboard navigable |
+| Stock items list page | Frontend B | Grid with columns: Code, Name, Barcode, Base Unit, Sale Price, Stock Qty, Actions |
+| Stock item detail page | Frontend A | Master-detail: header form + child stock levels table |
+| Stock adjustment dialog | Frontend A | Type (increase/decrease), qty, cost, reason → POST `/api/inventory/adjustments` |
+
+**DoD:**
+- Can list stock items, search, sort, page
+- Can create/edit stock item with validation
+- Can perform stock adjustment and see stock level update without page reload
+
+---
+
+#### M3: Purchasing UI (Weeks 5–6) — "Bill Entry & Line Items"
+
+**Goal:** Purchase bill entry with embedded editable line grid.
+
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| `DynamicTable` form-driven mini-grid | Frontend B | Add/remove/reorder rows; per-row stockitem lookup; qty/price/cost columns |
+| Purchase list page | Frontend B | Status filter, date range, vendor search, exported headers |
+| Purchase detail / create page | Frontend A | Header form (vendor, dates, payment type) + `DynamicTable` for items + bill costs section |
+| Purchase closure workflow | Frontend A | Close button disabled until `isPending=false`; confirmation modal |
+
+**DoD:**
+- Can create purchase on cash or credit
+- Line items editable inline; totals auto-calculate
+- Bill costs section allocates to items visually
+- Credit purchase shows A/P badge after refresh
+
+---
+
+#### M4: Sales & Billing UI (Weeks 7–8) — "Invoices"
+
+**Goal:** Sales invoice entry end-to-end with barcode and customer selection.
+
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Barcode input + product quick-add | Frontend A | Autofocus on mount; Enter triggers search; adds to invoice lines |
+| `CurrencyInput` component (AFN/USD toggle) | Frontend A | Base-AFN equivalent updates instantly; validates 4 decimals |
+| Invoice list page | Frontend B | Status tabs (Draft / Posted / Returned); customer filter; export |
+| Invoice create/edit page | Frontend A | Header form + `DynamicTable` lines + `CurrencyInput` totals + command bar |
+| Invoice submit flow | Frontend A | Validation → confirmation → loading → receipt view; list invalidates |
+
+**DoD:**
+- Can create invoice with customer, lines, payment type
+- Barcode scanner physically works (HID emulation)
+- Submit creates journals (backend M4 complete) and shows receipt
+- Negative stock blocked per org setting
+
+---
+
+#### M5: Returns & Adjustments UI (Weeks 9–10) — "Credit Notes & Vendor Returns"
+
+**Goal:** Return entry screens linked to original documents.
+
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| `ReturnDialog` (sales return) | Frontend A | Pre-populated from original invoice; qty ≤ original; reason picker; refund method |
+| `PurchaseReturnDialog` | Frontend A | Linked to original purchase; return type (refund/creditMemo) |
+| Returns list page | Frontend B | Filter by sale/purchase; status workflow (draft/posted/refunded) |
+| Return print view | Frontend B | Print-ready layout matching sales/purchase print |
+
+**DoD:**
+- Can open return from invoice detail
+- Return saves, posts reversing entries, restores stock
+- Cash refund or credit memo reflected in cash/payment module
+
+---
+
+#### M6: Accounting UI (Weeks 11–12) — "Ledgers & Reports"
+
+**Goal:** Read-heavy accounting screens with master-detail journals.
+
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Journals master-detail grid | Frontend B | Journal header → transaction lines expansion; date range filter |
+| Account ledger page | Frontend B | Account search → running balance; drill-to-journal; export CSV |
+| Trial balance page | Frontend B | Dry-run vs posted; period selector; acc/debit/credit columns |
+| Journal void/reverse action | Frontend A | Confirmation; creates reversing journal; updates list |
+
+**DoD:**
+- Can view all posted journals with drill-down
+- Trial balance ties to zero (or expected opening balance)
+- Void operation creates audit trail entry
+
+---
+
+#### M7: Cash Management UI (Weeks 13–14) — "Receipts, Payments, Exchange"
+
+**Goal:** Cash receipt/payment entry with multi-currency splits.
+
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Cash receipts list + create | Frontend A | Customer selection; amount in AFN/USD; split lines table |
+| Cash payments list + create | Frontend A | Vendor selection; split lines; linked to A/P when possible |
+| Currency exchange dialog | Frontend B | From/to cash account; rate input; gain/loss preview; 4-leg journal creation |
+| Cash transfer / withdrawal | Frontend A | Simple forms; validate against current balance |
+
+**DoD:**
+- Cash receipt updates A/R balance
+- Exchange creates entries with correct gain/loss legs
+- Print receipt available
+
+---
+
+#### M8: Payroll UI (Weeks 15–16) — "Salaries"
+
+**Goal:** Simple employee payment entry.
+
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Employee list + detail | Frontend B | Grid with search; detail shows payments history |
+| Salary payment entry | Frontend A | Employee selector; amount; splits; journalizes |
+
+**DoD:**
+- Payment creates expense + cash journal
+- Payroll run summary page
+
+---
+
+#### M9: Hardening & Print (Weeks 17–18) — "Enterprise Polish"
+
+**Goal:** RBAC, print/export, accessibility, performance, AI-agent handoff.
+
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| RBAC gating on all routes and action buttons | Frontend A | `hasPermission(module, action)` drives hide vs disable |
+| Print stylesheet for invoices, returns, receipts | Frontend B | Browser print preview clean; no sidebar; fits A4 |
+| XLSX multi-sheet export for reports | Frontend B | Header formatting; number formats; frozen panes preserved |
+| Virtualization tuning for 10k+ row lists | Frontend B | 60fps scroll; dynamic row height if needed |
+| Accessibility audit (keyboard, ARIA, color contrast) | Frontend A | WCAG AA; axe-core clean |
+| i18n scaffolding (English + Dari/Pashto placeholders) | Frontend A | `t()` function; lazy-loaded locales; RTL toggle reserved |
+| Error boundaries + Sentry (or equivalent) integration | Frontend A | Frontend errors captured with user context |
+| E2E critical paths (Login → Invoice → Return) | Frontend B | Playwright tests pass in CI |
+
+**DoD:**
+- All CRUD screens respect RBAC
+- Print and export work offline (cached data)
+- Lighthouse performance > 90 on list pages
+
+---
+
+### 5.9 Frontend Developer Standards (AI-Agent Ready)
+
+**Git commit messages:**
+```
+feat(sales): add invoice submit command bar action
+fix(inventory): prevent negative stock on adjustment
+refactor(shared): extract CurrencyColumn into ErpDataGrid
+test(sales): invoice submit happy path
+```
+
+**Branch naming:**
+- `feat/M4-sales-invoice`
+- `fix/M2-stock-adjustment-validation`
+
+**PR checklist:**
+- [ ] TypeScript strict mode passes
+- [ ] Vitest `--coverage` ≥ 80% for changed files
+- [ ] No `any` types without `// eslint-disable-next-line` justification
+- [ ] TanStack Query cache keys follow `[module, entity, params]` convention
+- [ ] Redux slice added only if state must survive route change or be undoable
+- [ ] Form validation error mapped to `FormField` error prop
+- [ ] Print layout tested in Chrome/Firefox print preview
+
+**File naming:**
+- `InvoicePage.tsx` — page component
+- `InvoiceForm.tsx` — feature-specific form
+- `useInvoice.ts` — feature query/mutation hooks
+- `salesApi.ts` — feature API surface
+- `invoiceSlice.ts` — Redux slice (if needed)
+
+**AI-agent guardrails:**
+- Always import from `@tanstack/react-query`, never mock fetch.
+- Use `zod` schemas from `shared/contracts` for validation.
+- Never inline styles; use `sx` prop or `styled()`.
+- Never store JWT in localStorage; use memory + HttpOnly refresh fallback.
+- Grid columns defined as `GridColDef[]` array with `type`, `width`, `editable`, `valueFormatter`.
 
 ---
 
@@ -662,7 +1027,7 @@ Think of it like a building:
 - **Domain** (inner core): Business rules, entities, value objects. No external dependencies.
 - **Application**: Use cases, commands, queries. Depends only on Domain.
 - **Infrastructure**: Database, file system, external APIs. Depends on Domain + Application.
-- **API**: HTTP/GraphQL endpoints. Depends on Infrastructure + Application.
+- **API**: REST endpoints. Depends on Infrastructure + Application.
 
 **Rule: Outer layers can depend on inner layers, never the reverse.**
 
@@ -671,9 +1036,8 @@ Instead of 7 separate microservices (too complex for MVP), we build ONE applicat
 with clear internal boundaries. Each "module" (Inventory, Sales, etc.) is a folder
 with its own Domain/Application/Infrastructure/API structure.
 
-#### What is GraphQL?
-Instead of REST endpoints (`GET /api/users`, `POST /api/accounts`), you have ONE endpoint
-(`/graphql`) where clients ask for exactly the data they need.
+#### What is REST API?
+Instead of GraphQL, clients interact with traditional REST endpoints (`GET /api/users`, `POST /api/accounts`). Each endpoint returns a specific resource representation.
 
 **Key concepts:**
 - **Query**: Read data (like GET)
@@ -688,33 +1052,85 @@ Instead of REST endpoints (`GET /api/users`, `POST /api/accounts`), you have ONE
 | Milestone | Person A (Domain + Application) | Person B (Infrastructure + API) |
 |-----------|--------------------------------|--------------------------------|
 | M1 Foundation | SharedKernel (VO, Result, Guard) + IdentityAccess.Domain | EF Core Configs + IdentityAccess.Infrastructure + API.Gateway |
-| M2 Inventory | Inventory.Domain + Inventory.Application | Inventory.Infrastructure + GraphQL Types |
-| M3 Purchasing | Purchasing.Domain + Purchasing.Application | Purchasing.Infrastructure + GraphQL Types |
-| M4 POS | Sales.Domain + Sales.Application | Sales.Infrastructure + GraphQL Types |
-| M5 Accounting | Accounting.Domain + Accounting.Application | Accounting.Infrastructure + GraphQL Types |
-| M6 Cash | Cash.Domain + Cash.Application | Cash.Infrastructure + GraphQL Types |
-| M7 Payroll | Payroll.Domain + Payroll.Application | Payroll.Infrastructure + GraphQL Types |
-| M8 Hardening | Add tests + validators | RBAC middleware + CI/CD |
+| M2 Inventory | Inventory.Domain + Inventory.Application | Inventory.Infrastructure + REST Controllers |
+| M3 Purchasing | Purchasing.Domain + Purchasing.Application | Purchasing.Infrastructure + REST Controllers |
+| M4 Sales & Billing | Sales.Domain + Sales.Application | Sales.Infrastructure + REST Controllers |
+| M5 Returns & Adjustments | Sales.Domain + Purchasing.Domain (return logic) | Sales.Infrastructure + Purchasing.Infrastructure + REST Controllers |
+| M6 Accounting | Accounting.Domain + Accounting.Application | Accounting.Infrastructure + REST Controllers |
+| M7 Cash | Cash.Domain + Cash.Application | Cash.Infrastructure + REST Controllers |
+| M8 Payroll | Payroll.Domain + Payroll.Application | Payroll.Infrastructure + REST Controllers |
+| M9 Hardening | Add tests + validators | RBAC middleware + CI/CD |
 
 ---
 
-## 7. Milestone Plan (Step-by-Step)
+## 7. Milestone Plan (Step-by-Step) — Backend & Frontend Pairs
+
+> Each backend milestone (BM) pairs with a frontend milestone (FM). Backend must complete first before frontend can integrate.
 
 ### M1: Foundation (2 weeks) — "Hello, Clean Architecture!"
 
-**What you'll learn:**
-- How to structure a .NET solution
-- What are Value Objects and why they matter
-- How EF Core maps C# classes to MariaDB tables
-- How to run a GraphQL server
+**Backend Goals:** Solution structure, auth flow, core entities
+**Frontend Goals:** App shell, routing, auth UI, shared framework foundations
 
-**Deliverables:**
-1. Working solution with 3 projects (SharedKernel, IdentityAccess.Domain, IdentityAccess.Infrastructure)
-2. MariaDB running in Docker with 5 tables (users, accounts, journals, transactions, financialperiods)
-3. GraphQL endpoint at `/graphql` with 2 queries + 2 mutations
-4. Seed script that creates admin user + Chart of Accounts
+#### BM1.1-BM1.5: Backend Tasks (Days 1-14)
+*See original plan lines 1084-1144*
 
-**Step-by-step tasks:**
+#### FM1.1: Shared Shell Foundation (Days 1-3)
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Initialize Vite + React + TypeScript project structure | Frontend A | `npm run dev` works; TypeScript strict mode enabled |
+| Install core packages: MUI v6, Redux Toolkit, TanStack Query v5, React Router v7, React Hook Form, Zod, axios | Frontend A | All packages resolve; no version conflicts |
+| Create enterprise MUI theme with Microsoft-inspired design system | Frontend A | Compact density (`-2`), Segoe UI font, `#0078d4` accent, flat borders |
+| Build `AppShell` layout with sidebar, header command bar, breadcrumb area | Frontend B | Layout responsive; sidebar collapsible; content area ready |
+| Implement `QueryClientProvider` with caching defaults | Frontend A | staleTime 30s, cacheTime 5min, retry 1, devtools enabled |
+| Implement Redux store with `ui.slice` (density, sidebar state) | Frontend A | Settings persist to localStorage; Redux DevTools connected |
+
+**DoD:**
+- [ ] `npm run dev` shows login screen in enterprise theme
+- [ ] Sidebar with placeholder navigation links
+- [ ] Redux DevTools shows state tree
+- [ ] TanStack Query DevTools shows cache structure
+
+#### FM1.2: Authentication Flow (Days 4-7)
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Create `authApi.ts` with login/register endpoints | Frontend A | Typed DTOs from `shared/contracts` |
+| Build `LoginPage` with username/password form using `ErpForm` | Frontend A | Zod validation; loading state; error handling |
+| Implement JWT token storage (in-memory + refresh cookie) | Frontend A | Token not in localStorage; HttpOnly refresh fallback |
+| Create `ProtectedRoute` component with permission checks | Frontend A | Redirects unauthorized; checks `module/action` perms |
+| Build `AuthProvider` context for user session management | Frontend B | Provides `user`, `isAuthenticated`, `hasPermission` |
+| Create route definitions in `router.tsx` | Frontend B | Nested routes for master-detail; auth guards applied |
+
+**DoD:**
+- [ ] Can login and receive JWT; protected routes redirect to login
+- [ ] Protected route enforces permission check via `hasPermission`
+- [ ] Logout clears session, redirects to login
+
+#### FM1.3: Shared Components Foundation (Days 8-10)
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Create `ErpForm` wrapper around React Hook Form + Zod | Frontend B | `react-hook-form` + `zodResolver` integrated |
+| Build `FormField` component with label, input, error display | Frontend B | Supports TextField, Select, DatePicker variants |
+| Create `LookupSearch` autocomplete component | Frontend A | Debounced search; keyboard navigation; create-new flow |
+| Build `CurrencyInput` with AFN/USD toggle | Frontend A | 4 decimal validation; base-AFN equivalent display |
+| Create loading/empty states for all components | Frontend A | Skeleton loaders for lists; empty state illustrations |
+
+**DoD:**
+- [ ] Form validation shows inline errors
+- [ ] LookupSearch can search accounts with debouncing
+- [ ] CurrencyInput validates and formats correctly
+
+#### FM1.4: Frontend Integration Testing (Days 11-14)
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Wire auth flow to backend endpoints | Frontend A | Login creates session; ProtectedRoute works |
+| Test protected route navigation | Frontend A | Unauthorized access redirects; authorized access proceeds |
+| Verify Redux + Query persistence | Frontend B | Refresh doesn't lose theme settings |
+| Add Vitest + React Testing Library config | Frontend B | Tests run with coverage; basic accessibility tests |
+
+**DoD:**
+- [ ] Complete auth flow working end-to-end
+- [ ] First passing unit tests in place
 
 #### M1.1: SharedKernel (Days 1-2)
 - [ ] Create `src/SharedKernel/SharedKernel.csproj`
@@ -757,41 +1173,79 @@ Instead of REST endpoints (`GET /api/users`, `POST /api/accounts`), you have ONE
 - [ ] Create `EfCoreRepository<T>` implementation
 - [ ] **Verify:** `dotnet build` succeeds for all projects
 
-#### M1.5: API.Gateway + GraphQL (Days 11-14)
-- [ ] Create GraphQL `Query` type with:
-  - `login(username, password): User` resolver
-  - `searchAccounts(q, subType): [Account]` resolver
-  - `account(id: Int!): Account` resolver
-- [ ] Create GraphQL `Mutation` type with:
-  - `register(username, password, isAdmin): User` resolver
-  - `createAccount(input: AccountInput!): Account` resolver
+#### M1.5: API.Gateway + REST Controllers (Days 11-14)
+- [ ] Create AuthController with:
+  - `POST /api/auth/login` (returns JWT)
+  - `POST /api/auth/register` (creates user)
+- [ ] Create AccountsController with:
+  - `GET /api/accounting/accounts` (search with q, subType query)
+  - `GET /api/accounting/accounts/{id}`
+  - `POST /api/accounting/accounts` (create account)
+- [ ] Configure JWT Bearer authentication in Program.cs
 - [ ] Configure MariaDB connection string
 - [ ] Create seed script (build/migrations/0001_initial.sql)
-- [ ] **Verify:** Run `docker compose up`, apply migration, open GraphQL Playground, run queries
+- [ ] **Verify:** Run `docker compose up`, apply migration, test endpoints with curl/Postman
 
 **DoD (Definition of Done):**
 - [ ] `docker compose up` starts MariaDB + Redis + API
-- [ ] GraphQL Playground accessible at `http://localhost:5000/graphql`
-- [ ] Can register a new user via mutation
-- [ ] Can search accounts via query
+- [ ] REST endpoints accessible at `http://localhost:5000/api/*`
+- [ ] Can register/login user via REST and receive JWT token
+- [ ] Can search accounts via `GET /api/accounting/accounts?q=name`
 - [ ] Seed data creates admin user (username: `administrator`, password: `1`)
 
 ---
 
 ### M2: Inventory Core (2 weeks) — "Products & Stock"
 
-**What you'll learn:**
-- How to model products with variants (UoM)
-- How stock levels are derived from journal entries
-- How to use EF Core value conversions
+**Backend Goals:** StockItem CRUD, StockLevel tracking, Stock adjustment
+**Frontend Goals:** Reusable grid/form components, stock item management UI
 
-**Deliverables:**
-1. StockItem CRUD via GraphQL
-2. StockLevel tracking per item per account
-3. Stock adjustment flow (increase/decrease) with journalization
-4. Barcode auto-generation
+#### BM2.1-BM2.4: Backend Tasks (Days 15-25)
+*See original plan lines 1162-1202*
 
-**Step-by-step tasks:**
+#### FM2.1: Reusable Table Framework (Days 15-17)
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Build `ErpDataGrid` wrapper around MUI X DataGrid | Frontend B | Server-side pagination, sorting, filtering; loading/empty states |
+| Create `CurrencyColumn` renderer component | Frontend B | Right-aligned; 4 decimals; AFN/USD color hint |
+| Create `StatusColumn` renderer (no pills, left border + bold) | Frontend A | Uses theme status colors; text-based status |
+| Implement column persistence to localStorage | Frontend A | Pinned/hidden/resized columns saved per user |
+| Add export to CSV/XLSX capability | Frontend B | Uses MUI X export API; preserves formatting |
+| Add print view for grids | Frontend B | CSS print media query; no sidebar in print |
+
+**DoD:**
+- [ ] Generic grid component works with any data source
+- [ ] Export downloads correctly formatted file
+- [ ] Column preferences persist across refreshes
+
+#### FM2.2: Stock Items UI (Days 18-21)
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Create `inventoryApi.ts` with all endpoints from BM2.4 | Frontend A | Typed hooks: `useStockItems`, `useStockItem`, `useCreateStockItem` |
+| Build `StockItemsListPage` using `ErpDataGrid` | Frontend B | Columns: Code, Name, Barcode, Base Unit, Sale Price, Stock Qty, Actions |
+| Implement search/filter by name, barcode, category | Frontend B | Debounced search; server-side filtering |
+| Create `StockItemForm` with `ErpForm` | Frontend A | All fields validated; barcode format check |
+| Build `StockItemDialog` for create/edit | Frontend A | Opens from list; closes on success; invalidates list |
+| Add barcode quick-add with keyboard shortcut | Frontend A | Focus on barcode field; enter adds new item |
+
+**DoD:**
+- [ ] Can list, search, paginate stock items
+- [ ] Can create/edit with validation
+- [ ] Stock level displays correctly
+
+#### FM2.3: Stock Adjust Entity UI (Days 22-25)
+| Task | Owner | Acceptance Criteria |
+|------|-------|---------------------|
+| Create `StockAdjustmentDialog` component | Frontend A | Reason picker; qty input; increase/decrease toggle |
+| Add stock adjustment button to StockItem detail | Frontend A | Opens dialog; shows adjustment history |
+| Implement adjustment history grid (`ErpDataGrid`) | Frontend B | Date, Type, Qty, Cost, Reason, User columns |
+| Hook up to backend `/api/inventory/adjustments` | Frontend A | POST creates adjustment; invalidates stock level |
+| Add optimistic update for stock level change | Frontend A | UI updates immediately; rollback on error |
+
+**DoD:**
+- [ ] Can adjust stock from item detail
+- [ ] Adjustment history shows all changes
+- [ ] Stock level updates without page reload
 
 #### M2.1: Inventory.Domain (Days 15-17)
 - [ ] Create `StockItem` entity (name, code, barcode, prices)
@@ -816,11 +1270,16 @@ Instead of REST endpoints (`GET /api/users`, `POST /api/accounts`), you have ONE
 - [ ] Create `StockItemRepository`, `StockLevelRepository`
 - [ ] **Verify:** Migrations apply to MariaDB
 
-#### M2.4: Inventory.GraphQL (Days 23-25)
-- [ ] Add `stockItems` query (paginated, filterable)
-- [ ] Add `stockLevel(itemId)` query
-- [ ] Add `createStockItem` mutation
-- [ ] Add `adjustStock` mutation (increase/decrease)
+#### M2.4: Inventory.API Controllers (Days 23-25)
+- [ ] Create `StockItemsController` with:
+  - `GET /api/inventory/items` (paginated, filterable)
+  - `GET /api/inventory/items/{id}`
+  - `POST /api/inventory/items`
+  - `PUT /api/inventory/items/{id}`
+- [ ] Create `StockLevelsController` with:
+  - `GET /api/inventory/items/{id}/stock`
+- [ ] Create `StockAdjustmentsController` with:
+  - `POST /api/inventory/adjustments` (increase/decrease)
 - [ ] **Verify:** Can create item, adjust stock, see stock level change
 
 **DoD:**
@@ -839,7 +1298,7 @@ Instead of REST endpoints (`GET /api/users`, `POST /api/accounts`), you have ONE
 - How partial payments work
 
 **Deliverables:**
-1. StockPurchase CRUD via GraphQL
+1. StockPurchase CRUD via REST API
 2. Bill cost allocation
 3. Credit purchase creates A/P automatically
 4. Purchase closure with payment
@@ -856,46 +1315,82 @@ Instead of REST endpoints (`GET /api/users`, `POST /api/accounts`), you have ONE
 - [ ] Create `ClosePurchaseCommand`
 - [ ] Create `GetPurchaseQuery`
 
-#### M3.3: Purchasing.Infrastructure + API (Days 31-34)
+#### M3.3: Purchasing.Infrastructure + API Controllers (Days 31-34)
 - [ ] EF configurations for all 5 tables
-- [ ] GraphQL mutations + queries
+- [ ] REST Controllers for purchases endpoints
 - [ ] **Verify:** Credit purchase creates A/P journal entry
 
 ---
 
-### M4: POS System (2 weeks) — "Fast Checkout"
+### M4: Sales & Billing (2 weeks) — "Invoices & Revenue"
 
 **What you'll learn:**
-- How to build a transaction that spans multiple aggregates
+- How sales invoices span multiple aggregates
 - How to use ambient transactions
-- How to emit domain events
+- How A/R (Accounts Receivable) is created
+- How revenue recognition + COGS + stock happen atomically
 
 **Deliverables:**
-1. POS checkout GraphQL mutation
-2. Creates 4 journals atomically (cash, revenue, COGS, stock)
+1. Sales invoice REST endpoint (`POST /api/sales/invoices`)
+2. Creates journals atomically (A/R, revenue, COGS, stock)
 3. Decreases stock levels
-4. Creates cash receipt
+4. Creates cash receipt or A/R balance
 
 #### M4.1: Sales.Domain (Days 35-37)
-- [ ] Create `StockSale` entity
-- [ ] Create `StockSaleItem` entity
-- [ ] Create `StockPOSSale` entity
+- [ ] Create `StockSale` entity (customer, payment type, totals)
+- [ ] Create `StockSaleItem` entity (line items)
+- [ ] Create `StockPOSSale` entity (fast invoice variant)
 - [ ] Create `StockPOSSaleItem` entity
 - [ ] Create `StockSaleExCash` entity
 - [ ] Create `WalkInCustomer` entity
 
 #### M4.2: Sales.Application (Days 38-39)
-- [ ] Create `CheckoutCommand` (the big one!)
-- [ ] Create `Cart` value object (validation, totals)
+- [ ] Create `SubmitInvoiceCommand` (the big one!)
+- [ ] Create `InvoiceCart` value object (validation, totals)
 
-#### M4.3: Sales.Infrastructure + API (Days 40-43)
+#### M4.3: Sales.Infrastructure + API Controllers (Days 40-43)
 - [ ] EF configurations for 7 tables
-- [ ] GraphQL mutation `posCheckout`
-- [ ] **Verify:** Full POS sale creates 4 journals atomically
+- [ ] SalesController with `POST /api/sales/invoices` endpoint
+- [ ] **Verify:** Full invoice creates journals atomically
 
 ---
 
-### M5: Accounting Engine (2 weeks) — "Double-Entry Bookkeeping"
+### M5: Returns & Adjustments (2 weeks) — "Customer & Vendor Returns"
+
+**What you'll learn:**
+- How sales returns reverse A/R, revenue, and COGS
+- How purchase returns reverse A/P and stock valuation
+- How refunds and credit memos work in double-entry
+
+**Deliverables:**
+1. Sales return (credit note) REST endpoint (`POST /api/sales/returns`)
+2. Purchase return REST endpoint (`POST /api/purchasing/returns`)
+3. Reversing journals + stock restoration
+4. Refund and credit memo flows
+
+#### M5.1: Sales Returns (Days 44-46)
+- [ ] Create `CreditNote` entity (references original sale)
+- [ ] Create `CreditNoteItem` entity
+- [ ] Create `SubmitSalesReturnCommand`
+- [ ] REST endpoint: `POST /api/sales/returns`
+- [ ] **Verify:** Return creates reversing journals, restores stock
+
+#### M5.2: Purchase Returns (Days 47-49)
+- [ ] Create `PurchaseReturn` entity (references original purchase)
+- [ ] Create `PurchaseReturnItem` entity
+- [ ] Create `SubmitPurchaseReturnCommand`
+- [ ] REST endpoint: `POST /api/purchasing/returns`
+- [ ] **Verify:** Return reverses A/P, decreases stock, creates refund or credit memo
+
+#### M5.3: Return Flows Integration (Days 50-52)
+- [ ] Cash payment for refunds
+- [ ] Credit memo -> future invoice offset
+- [ ] Audit logs for returns
+- [ ] **Verify:** End-to-end return + refund flow works
+
+---
+
+### M6: Accounting Engine (2 weeks) — "Double-Entry Bookkeeping"
 
 **What you'll learn:**
 - How double-entry accounting works in code
@@ -907,23 +1402,23 @@ Instead of REST endpoints (`GET /api/users`, `POST /api/accounts`), you have ONE
 2. Trial balance report
 3. Account ledger report
 
-#### M5.1: Accounting.Domain (Days 44-46)
+#### M6.1: Accounting.Domain (Days 53-55)
 - [ ] Add `Revenues` entity
 - [ ] Add `Expenses` entity
 - [ ] Add `BalanceAdjustment` entity
 
-#### M5.2: Accounting.Application (Days 47-48)
+#### M6.2: Accounting.Application (Days 56-57)
 - [ ] Create `JournalPoster` service (validates dr==cr)
 - [ ] Create `GetTrialBalanceQuery`
 - [ ] Create `GetAccountLedgerQuery`
 
-#### M5.3: Accounting.Infrastructure + API (Days 49-52)
+#### M6.3: Accounting.Infrastructure + API Controllers (Days 58-61)
 - [ ] EF configurations
-- [ ] GraphQL queries for reports
+- [ ] REST Controllers for journals, transactions, trial balance, account ledger endpoints
 
 ---
 
-### M6: Cash Management (1.5 weeks) — "Money In, Money Out"
+### M7: Cash Management (1.5 weeks) — "Money In, Money Out"
 
 **What you'll learn:**
 - How cash receipts/payments journalize
@@ -934,21 +1429,21 @@ Instead of REST endpoints (`GET /api/users`, `POST /api/accounts`), you have ONE
 2. Cash payment flow
 3. AFN↔USD exchange with gain/loss
 
-#### M6.1: Cash.Domain + Application (Days 53-55)
+#### M7.1: Cash.Domain + Application (Days 62-64)
 - [ ] CashPayment, CashPaymentItem entities
 - [ ] CashReceipt, CashReceiptItem entities
 - [ ] CashExchange entity
 - [ ] CashTransfer entity
 - [ ] Withdrawal entity
 
-#### M6.2: Cash.Infrastructure + API (Days 56-58)
+#### M7.2: Cash.Infrastructure + API Controllers (Days 65-67)
 - [ ] EF configurations for 7 tables
-- [ ] GraphQL mutations
+- [ ] REST Controllers for cash endpoints (receipts, payments, exchanges)
 - [ ] **Verify:** Exchange creates 4-leg journal with correct gain/loss
 
 ---
 
-### M7: Payroll Light (1 week) — "Salaries"
+### M8: Payroll Light (1 week) — "Salaries"
 
 **What you'll learn:**
 - How payroll runs link to journals
@@ -958,29 +1453,29 @@ Instead of REST endpoints (`GET /api/users`, `POST /api/accounts`), you have ONE
 1. Employee master
 2. Salary payment with journalization
 
-#### M7.1-7.2: Payroll (Days 59-63)
+#### M8.1-8.2: Payroll (Days 68-72)
 - [ ] EmployeeAccount entity
 - [ ] Payroll, PayrollItem entities
 - [ ] EmployeePayment, EmployeePaymentItem entities
-- [ ] GraphQL mutations
+- [ ] REST Controllers for payroll endpoints
 
 ---
 
-### M8: Hardening (1.5 weeks) — "Production Ready"
+### M9: Hardening (1.5 weeks) — "Production Ready"
 
 **What you'll learn:**
-- How to add RBAC to GraphQL resolvers
+- How to add RBAC to REST endpoints
 - How to write integration tests
 - How to set up CI/CD
 
 **Deliverables:**
-1. RBAC on all GraphQL fields
-2. Integration tests for POS + Purchase + Exchange
+1. RBAC on all REST endpoints
+2. Integration tests for Invoice + Purchase + Return + Exchange
 3. Docker Compose for full stack
 4. GitHub Actions CI/CD
 
-#### M8.1-8.2: Security + Testing (Days 64-68)
-- [ ] Add `[Authorize]` + permission checks to GraphQL resolvers
+#### M9.1-9.2: Security + Testing (Days 73-77)
+- [ ] Add `[Authorize]` + permission checks to REST controllers
 - [ ] Write 4 key integration tests
 - [ ] Add Serilog logging
 - [ ] Add health checks
@@ -997,85 +1492,116 @@ Instead of REST endpoints (`GET /api/users`, `POST /api/accounts`), you have ONE
 | `timestamptz` not found | PostgreSQL type | Use `datetime(6)` for MariaDB |
 | `bigserial` not found | PostgreSQL type | Use `bigint AUTO_INCREMENT` for MariaDB |
 | Cannot assign to read-only property | Domain entity has private set | Use constructor or make setter internal |
+| Return quantity exceeds original sale | Business rule violation | Validate return qty ≤ original invoice qty |
+| Purchase return without stock | Stock not physically returned | Require stock on hand or allow negative stock |
 
 ---
 
-## 9. Quick Reference: GraphQL HotChocolate
+## 9. Quick Reference: REST API Controllers
 
 ```csharp
-// 1. Define your schema types
-public class Query
+// 1. Define your controller
+[ApiController]
+[Route("api/[controller]")]
+public class SalesController : ControllerBase
 {
-    public async Task<User?> Login([Service] AppDbContext db, string username, string password)
+    [HttpPost("invoices")]
+    public async Task<ActionResult<StockSale>> CreateInvoice([FromBody] CreateInvoiceRequest request)
     {
-        // Your resolver logic here
+        // Your logic here
     }
-}
 
-public class Mutation
-{
-    public async Task<User> Register([Service] AppDbContext db, string username, string password)
+    [HttpPost("returns")]
+    public async Task<ActionResult<CreditNote>> CreateReturn([FromBody] CreateReturnRequest request)
     {
-        // Your mutation logic here
+        // Your logic here
     }
 }
 
 // 2. Register in Program.cs
-builder.Services
-    .AddGraphQLServer()
-    .AddQueryType<Query>()
-    .AddMutationType<Mutation>();
+builder.Services.AddControllers();
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options => { /* configure */ });
 
-// 3. Map the endpoint
-app.MapGraphQL();
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
 
-// 4. Access playground at /graphql (dev only)
+// 3. Access Swagger at /swagger (dev only)
 ```
 
 ---
 
-## 8. Security Architecture
+## 10. Security Architecture
 
-### 8.1 Auth (.NET)
-- JWT Bearer with RS256 (private key in env, public exposed)
+### 10.1 Auth (.NET)
+- JWT Bearer with HS256 (shared key in env)
 - Access token: 1h, Refresh token: 7d (HttpOnly Secure cookie)
-- Password: ASP.NET Core Identity's `PasswordHasher<TUser>` (PBKDF2)
-- `users.password` column re-purposed as Identity hash; legacy migration required
+- Password: SHA256 for MVP (upgrade to ASP.NET Core Identity PBKDF2 later)
+- `users.password` column stores SHA256 hash
 
-### 8.2 RBAC
+### 10.2 RBAC
 - `privileges.rules` JSON: `{ "module": "inventory", "actions": ["read","write","delete"] }`
-- Evaluated in MediatR pipeline behavior + frontend route guard
+- Evaluated via middleware + frontend route guard
 - `isAdmin` bypasses all checks
 
-### 8.3 Frontend Protection
+### 10.3 Frontend Protection
 - `ProtectedRoute` wrapper checks `hasPermission(module, action)` from React Context
-- Route config: `{ path: '/pos', module: 'pos', action: 'read' }`
+- Route configs:
+  - Sales invoices: `{ path: '/sales', module: 'sales', action: 'read' }`
+  - Returns: `{ path: '/returns', module: 'sales', action: 'write' }`
+  - Purchasing: `{ path: '/purchasing', module: 'purchasing', action: 'read' }`
 
-### 8.4 MariaDB Security
-- Connection via TCP/wire TLS
+### 10.4 MariaDB Security
+- Connection via TCP/wire TLS in production
 - App DB user: DML only (no DDL). Migrations run via separate admin user.
 - Single-tenant MVP; prepare for multi-tenant later.
-- `MariaDB audit plugin` for DDL audit.
 
-### 8.5 Audit Logging
+### 10.5 Audit Logging
 - `auditlogs(id, userId, action, refType, refId, oldValue, newValue, ip, userAgent, createdAt)`
 - Inserted by MediatR post-processing pipeline (after commit)
 - Immutable: no UPDATE/DELETE allowed (enforced by trigger squashing to readonly replica for compliance).
 
-### 8.6 OWASP Protections
+### 10.6 OWASP Protections
 - JWT in Authorization header only (no query string)
-- CORS strict origin allowlist
+- CORS strict origin allowlist in production
 - All inputs validated via FluentValidation (backend) + Zod (frontend)
 - SQL injection: EF Core parameterized queries only
 - XSS: MUI sanitizes; React auto-escapes
-- CSRF: SameSite cookies for refresh token + header-based access token
-- Rate limiting: ASP.NET Core `RateLimiter` middleware (100 req/min per user for POS, 30 for login)
+- Rate limiting: ASP.NET Core `RateLimiter` middleware (100 req/min per user for invoices, 30 for login)
 
 ---
 
-## 9. Performance Strategy (MariaDB)
+## 11. Testing & QA Strategy
 
-### 9.1 Indexing
+### 11.1 Backend (.NET)
+| Layer | Tool | Scope |
+|-------|------|-------|
+| Unit | xUnit | Domain logic (e.g. DoubleEntryValidator, Unit conversion) |
+| Integration | xUnit + Respawn + Testcontainers (MariaDB) | Full repository + EF Core mapping |
+| API | xUnit + WebApplicationFactory | End-to-end per module |
+| Contract | Verify (or manual) | JSON schema per endpoint |
+
+**Key integration tests:**
+- `InvoiceScenario`: create invoice, post transactions, decrease stock, create cash receipt → read back trial balance == 0
+- `PurchaseCreditScenario`: create purchase on credit, verify A/P balance
+- `SalesReturnScenario`: create credit note, reverse revenue/COGS, restore stock, refund cash
+- `PurchaseReturnScenario`: create purchase return, reverse A/P, decrease stock
+- `ExchangeScenario`: convert USD → AFN, verify gain/loss leg + cash balances
+- `UnauthorizedAccess`: user without privilege gets 403
+
+### 11.2 Frontend
+| Layer | Tool | Scope |
+|-------|------|-------|
+| Component | Vitest + RTL | Invoice form, stock table, return dialog, login form |
+| Hook | Vitest | useInvoiceCart, useDebounce, useAuth |
+| E2E | Playwright | Full sales flow: login → search → invoice → submit → return |
+
+---
+
+## 12. Performance Strategy (MariaDB)
+
+### 12.1 Indexing
 ```sql
 -- Core lookups
 CREATE INDEX ix_accounts_subtype ON accounts(subType) WHERE isSystem = 0;
@@ -1085,69 +1611,55 @@ CREATE INDEX ix_journals_date_fp ON journals(date, fpId);
 CREATE INDEX ix_journals_type ON journals(type);
 CREATE INDEX ix_transactions_account ON transactions(accountId);
 CREATE INDEX ix_stockpossales_customer ON stockpossales(customerAccountId);
+CREATE INDEX ix_creditnotes_related_sale ON creditnotes(relatedSaleId);
+CREATE INDEX ix_purchasereturns_related_purchase ON purchasereturns(relatedPurchaseId);
 
 -- Cash lookups
 CREATE INDEX ix_cashreceipts_journal ON cashreceipts(journalId);
 CREATE INDEX ix_cashpayments_journal ON cashpayments(journalId);
-
--- JSON
-CREATE INDEX ix_privileges_rules ON privileges ( (JSON_LENGTH(rules)) );
 ```
 
-### 9.2 Query Optimization
+### 12.2 Query Optimization
 - Avoid N+1: Use EF Core `Include` for stocklevels -> stockitems; eager load in Read models.
 - Pagination: Cursor-based for large journal/transaction lists; offset for UI tables (page 50 max).
 - Materialized View (optional): daily stock snapshot refreshed nightly for reports.
 
-### 9.3 Connection Pooling
+### 12.3 Connection Pooling
 - MySql connection pool: Min 5, Max 50 per service.
 - Redis connection: separate pool, multiplexed.
 
-### 9.4 Redis Caching
-| Key | TTL | Invalidation |
-|-----|-----|--------------|
-| `stock:{id}:level` | 5m | On stockadjustment / sale / purchase |
-| `account:{id}:balance` | 1m | On cashpayment / receipt / journal |
-| `user:{id}:permissions` | 15m | On privilege change |
-| `org:config` | 1h | On org update |
-| `financial:period:current` | 10m | On period close |
+---
 
-### 9.5 POS Performance
-- Product search: Redis-backed query cache + MariaDB trigram index on `stockitems(name)`
-- Barcode lookup: unique index on `stockitems.code` (covers barcode if unified)
-- Cart Add: single `UPDATE stocklevels SET quantity = quantity - :qty WHERE stockItemId = :id`
-- Receipt generation: async background job (not blocking POS response)
+## 13. Caching Strategy
+
+### 13.1 Redis Keys
+```
+stock:levels:{stockItemId}     → JSON { qty, cost }
+account:balance:{accountId}    → JSON { dr, cr, net }
+user:perms:{userId}            → JSON { module: [actions] }
+org:config                     → JSON { allowNegativeStock, decimals }
+fx:rate:{from}:{to}:{date}    → decimal  (optional future)
+```
+
+### 13.2 Invalidation Rules
+- Stock level updated → `DEL stock:levels:{id}`
+- Account balance changed → `DEL account:balance:{id}`
+- Privilege changed → `DEL user:perms:{id}` + pub/sub notify all instances
+- Config changed → `DEL org:config`
+
+### 13.3 Cache-Aside Pattern
+All reads:
+```
+val = await redis.GetAsync(key);
+if (val == null) { val = await db.GetAsync(); await redis.SetAsync(key, val, ttl); }
+return val
+```
 
 ---
 
-## 10. Testing & QA Strategy
+## 14. Monitoring & Observability
 
-### 10.1 Backend (.NET)
-| Layer | Tool | Scope |
-|-------|------|-------|
-| Unit | xUnit | Domain logic (e.g. DoubleEntryValidator, Unit conversion) |
-| Integration | xUnit + Respawn + Testcontainers (MariaDB) | Full repository + EF Core mapping |
-| API | xUnit + WebApplicationFactory | End-to-end per module |
-| Contract | Verify (or manual) | JSON schema per endpoint |
-
-**Key integration tests:**
-- `PosSaleScenario`: create journal, post transactions, decrease stock, create cash receipt → read back trial balance == 0
-- `PurchaseCreditScenario`: create purchase on credit, verify A/P balance
-- `ExchangeScenario`: convert USD → AFN, verify gain/loss leg + cash balances
-- `UnauthorizedAccess`: user without privilege gets 403
-
-### 10.2 Frontend
-| Layer | Tool | Scope |
-|-------|------|-------|
-| Component | Vitest + RTL | POS cart, stock table, login form |
-| Hook | Vitest | usePOSCart, useDebounce, useAuth |
-| E2E | Playwright | Full POS flow: login → search → cart → checkout → receipt |
-
----
-
-## 11. Monitoring & Observability
-
-### 11.1 Logging (Serilog)
+### 14.1 Logging (Serilog)
 ```csharp
 Log.Logger = new LoggerConfiguration()
   .Enrich.FromLogContext()
@@ -1159,54 +1671,28 @@ Log.Logger = new LoggerConfiguration()
 
 Structured fields: `UserId`, `Action`, `RefType`, `RefId`, `DurationMs`, `CorrelationId`
 
-### 11.2 Tracing (OpenTelemetry)
+### 14.2 Tracing (OpenTelemetry)
 - Instrument ASP.NET Core, EF Core, HttpClient, MediatR
 - Export to Jaeger (dev) / OTLP collector (prod)
-- Trace per POS sale: full span tree across inventory → accounting → cash
+- Trace per invoice submit: full span tree across sales → inventory → accounting → cash
 
-### 11.3 Metrics (Prometheus)
+### 14.3 Metrics (Prometheus)
 - `http_request_duration_seconds` by route + status
 - `db_query_duration_seconds` by query hash
-- `pos_checkout_duration_seconds`
+- `invoice_submit_duration_seconds`
+- `purchase_return_duration_seconds`
 - `stock_level_updates_total`
 - `active_users gauge`
 
-### 11.4 Health Checks
+### 14.4 Health Checks
 Per module: `Identity`, `Inventory`, `Accounting`, `Cash`, `Database`, `Redis`
 Endpoint: `/health` (liveness) + `/health/ready` (readiness)
 
 ---
 
-## 12. Caching Strategy
+## 15. Audit System Design
 
-### 12.1 Redis Keys
-```
-stock:levels:{stockItemId}     → JSON { qty, cost }
-account:balance:{accountId}    → JSON { dr, cr, net }
-user:perms:{userId}            → JSON { module: [actions] }
-org:config                     → JSON { allowNegativeStock, decimals }
-fx:rate:{from}:{to}:{date}    → decimal  (optional future)
-```
-
-### 12.2 Invalidation Rules
-- Stock level updated → `DEL stock:levels:{id}`
-- Account balance changed → `DEL account:balance:{id}`
-- Privilege changed → `DEL user:perms:{id}` + pub/sub notify all instances
-- Config changed → `DEL org:config`
-
-### 12.3 Cache-Aside Pattern
-All reads:
-```
-val = await redis.GetAsync(key);
-if (val == null) { val = await db.GetAsync(); await redis.SetAsync(key, val, ttl); }
-return val
-```
-
----
-
-## 13. Audit System Design
-
-### 13.1 Table
+### 15.1 Table
 ```sql
 CREATE TABLE auditlogs (
   id bigint AUTO_INCREMENT PRIMARY KEY,
@@ -1225,31 +1711,33 @@ CREATE TABLE auditlogs (
 );
 ```
 
-### 13.2 Capture Points
+### 15.2 Capture Points
 | Event | oldValue | newValue |
 |-------|----------|----------|
-| POS Sale | — | StockPOSSale summary |
+| Invoice Submit | — | StockSale summary |
 | Purchase | — | StockPurchase summary |
 | Journal Post | — | Journal transactions |
 | Stock Adjustment | Before stocklevel | After stocklevel |
+| Sales Return (Credit Note) | Before stocklevel | After stocklevel |
+| Purchase Return | Before stocklevel | After stocklevel |
 | Cash Exchange | Before balances | After balances |
 | Permission Change | Before rules | After rules |
 
-### 13.3 Compliance
+### 15.3 Compliance
 - Append-only (no UPDATE/DELETE on auditlogs)
 - Retention: 7 years (archival to S3 quarterly)
 - Access: read-only for all except superadmin
 
 ---
 
-## 14. DevOps & Deployment
+## 16. DevOps & Deployment
 
-### 14.1 Docker
+### 16.1 Docker
 ```yaml
 # docker-compose.yml
 services:
   api:
-    build: ./src/API
+    build: ./src/API.Gateway
     depends_on: [mariadb, redis]
   web:
     build: ./src/web
@@ -1263,43 +1751,43 @@ services:
     image: redis:7-alpine
 ```
 
-### 14.2 CI/CD (GitHub Actions)
+### 16.2 CI/CD (GitHub Actions)
 - `build.yml`: dotnet build + test + docker build
 - `deploy.yml`: on merge to main → SSH into server → docker pull + compose up
 - `migrate.yml`: run `dotnet ef database update` against target env (staged, prod)
 - `backup.yml`: daily mysqldump to `/backups` + upload to S3
 
-### 14.3 Environment Strategy
+### 16.3 Environment Strategy
 | Env | DB | Purpose |
 |-----|----|---------|
 | local | Docker MariaDB | Dev |
 | staging | Docker MariaDB | QA / UAT |
 | production | Managed MariaDB (e.g. Supabase/Railway) | Live |
 
-### 14.4 Migration Strategy
+### 16.4 Migration Strategy
 - `dotnet ef migrations add` per bounded context change
 - Migrations run in CI/CD only (never auto-run on app start in production)
 - Down migrations: supported but require manual approval + backup before execute
 
-### 14.5 Backup Strategy
+### 16.5 Backup Strategy
 - Continuous binary log archiving (MariaDB `binlog` to S3)
 - Daily base backup (mariabackup)
 - Retention: 30 days hot, 1 year cold (S3 Glacier)
 
-### 14.6 Rollback
+### 16.6 Rollback
 1. Feature flags (LaunchDarkly or simple DB table): hot-disable new flows
 2. DB migration rollback: `dotnet ef database update PreviousMigration`
 3. Deployment rollback: `docker compose down && docker compose up <previous-image>`
 
 ---
 
-## 15. Final Deliverables
+## 17. Final Deliverables
 
 1. **MariaDB schema** — fully migrated from MySQL, numeric-safe, indexed
 2. **7 .NET 8 projects** — modular monolith, Clean Architecture per module
-3. **React SPA** — POS-first, TypeScript, MUI, React Query + Apollo Client
+3. **React SPA** — Sales/Billing-first, TypeScript, MUI, React Query
 4. **Docker Compose** — one-command local/dev startup
 5. **GitHub Actions** — CI/CD + daily backup
-6. **API documentation** — GraphQL Playground + HotChocolate schema per module, aggregated in gateway
+6. **API documentation** — Swagger/OpenAPI per module, aggregated in gateway
 7. **Runbook** — backup/restore, rollback, monitoring queries
 8. **UAT checklist** — per milestone DoD with test scenarios

@@ -27,8 +27,12 @@ services:
       - redis
     environment:
       - ASPNETCORE_URLS=http://+:5000
+      - ASPNETCORE_ENVIRONMENT=Development
       - ConnectionStrings__Default=Server=mariadb;Port=3306;Database=afghan_commerce;User=admin;Password=adminpass
       - Redis__ConnectionString=redis:6379
+      - Jwt__Key=development-secret-key-at-least-32-characters
+      - Jwt__Issuer=https://afghan-commerce.local
+      - Jwt__Audience=https://afghan-commerce.local
 
 volumes:
   mariadb_data:

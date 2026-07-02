@@ -14,7 +14,7 @@ public class JwtTokenGenerator
 
     public JwtTokenGenerator(IConfiguration configuration)
     {
-        _secretKey = configuration["Jwt:Secret"] ?? "default-secret-key-change-me";
+        _secretKey = configuration["Jwt:Key"] ?? "development-secret-key-at-least-32-characters";
     }
 
     public string GenerateToken(User user)
