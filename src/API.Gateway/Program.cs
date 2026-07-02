@@ -1,91 +1,96 @@
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using HotChocolate;
-using HotChocolate.AspNetCore;
-using AfghanCommerceCloud.IdentityAccess.Application.Users.DTOs;
-using AfghanCommerceCloud.IdentityAccess.Infrastructure.Persistence;
-using AfghanCommerceCloud.IdentityAccess.Domain.Entities;
-using AfghanCommerceCloud.IdentityAccess.Domain.ValueObjects;
-using System.Security.Cryptography;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
 using System.Text;
+using Microsoft.OpenApi.Models;
+using AfghanCommerceCloud.IdentityAccess.Infrastructure.Persistence;
+using AfghanCommerceCloud.IdentityAccess.Infrastructure.Repositories;
+using AfghanCommerceCloud.IdentityAccess.Infrastructure.Identity;
+using AfghanCommerceCloud.IdentityAccess.Application.Common;
 
 var builder = WebApplication.CreateBuilder(args);
 
+var jwtKey = builder.Configuration["Jwt:Key"] ?? "development-secret-key-at-least-32-characters";
+var jwtIssuer = builder.Configuration["Jwt:Issuer"] ?? "https://afghan-commerce.local";
+var jwtAudience = builder.Configuration["Jwt:Audience"] ?? "https://afghan-commerce.local";
+
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseMySql(
-        builder.Configuration.GetConnectionString("DefaultConnection") ?? "Server=localhost;Port=3306;Database=afghan_commerce;User=admin;Password=adminpass;",
-        new MySqlServerVersion(new Version(8, 0, 0))
+        builder.Configuration.GetConnectionString("DefaultConnection") ?? "Server=mariadb;Port=3306;Database=afghan_commerce;User=admin;Password=adminpass;SslMode=none",
+        new MySqlServerVersion(new Version(11, 0, 0))
     )
 );
 
-builder.Services
-    .AddGraphQLServer()
-    .AddQueryType<Query>()
-    .AddMutationType<Mutation>();
+builder.Services.AddScoped(typeof(IRepository<>), typeof(EfCoreRepository<>));
+builder.Services.AddSingleton(sp => new JwtTokenGenerator(builder.Configuration));
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = jwtIssuer,
+            ValidAudience = jwtAudience,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
+        };
+    });
+
+builder.Services.AddAuthorization();
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("Development", policy =>
+    {
+        policy.AllowAnyOrigin()
+              .AllowAnyHeader()
+              .AllowAnyMethod();
+    });
+    options.AddPolicy("AllowSpecific", policy =>
+    {
+        policy.WithOrigins("https://afghan-commerce.local")
+              .AllowAnyHeader()
+              .AllowAnyMethod();
+    });
+});
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(c =>
+{
+    c.SwaggerDoc("v1", new OpenApiInfo { Title = "Afghan Commerce Cloud API", Version = "v1" });
+    c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        Description = "JWT Authorization header using the Bearer scheme",
+        Name = "Authorization",
+        In = ParameterLocation.Header,
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer"
+    });
+    c.AddSecurityRequirement(new OpenApiSecurityRequirement
+    {
+        {
+            new OpenApiSecurityScheme { Reference = new OpenApiReference { Id = "Bearer", Type = ReferenceType.SecurityScheme } },
+            Array.Empty<string>()
+        }
+    });
+});
 
 var app = builder.Build();
 
 if (app.Environment.IsDevelopment())
 {
     app.UseDeveloperExceptionPage();
+    app.UseSwagger();
+    app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "Afghan Commerce Cloud API v1"));
 }
 
-app.MapGet("/health", () => "Afghan Commerce Cloud API Gateway is running");
-
-app.MapGraphQL();
+app.UseRouting();
+app.UseCors(app.Environment.IsDevelopment() ? "Development" : "AllowSpecific");
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
+app.MapGet("/health", () => Results.Ok("Afghan Commerce Cloud API Gateway is running"));
 
 app.Run();
-
-public class Query
-{
-    public async Task<User?> Login([Service] AppDbContext db, string username, string password)
-    {
-        var user = await db.Users.FirstOrDefaultAsync(u => u.Username == username && u.IsActive);
-        if (user == null) return null;
-        
-        var hash = Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes(password)));
-        return user;
-    }
-
-    public async Task<IEnumerable<Account>> SearchAccounts([Service] AppDbContext db, string? q, string? subType)
-    {
-        var query = db.Accounts.AsNoTracking();
-        if (!string.IsNullOrEmpty(q))
-            query = query.Where(a => a.Name.Contains(q) || (a.Phone != null && a.Phone.Contains(q)));
-        if (!string.IsNullOrEmpty(subType))
-            query = query.Where(a => a.SubType == subType);
-        return await query.Take(50).ToListAsync();
-    }
-
-    public async Task<Account?> Account([Service] AppDbContext db, int id)
-    {
-        return await db.Accounts.FindAsync(id);
-    }
-}
-
-public class Mutation
-{
-    public async Task<User> Register([Service] AppDbContext db, string username, string password, bool isAdmin = false)
-    {
-        var passwordHash = Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes(password)));
-        var user = new User(
-            Username.From(username),
-            HashedPassword.FromHash(passwordHash),
-            isAdmin
-        );
-        db.Users.Add(user);
-        await db.SaveChangesAsync();
-        return user;
-    }
-
-    public async Task<Account> CreateAccount([Service] AppDbContext db, Account input)
-    {
-        input.Date = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
-        input.CreatedAt = DateTimeOffset.UtcNow;
-        input.UpdatedAt = DateTimeOffset.UtcNow;
-        db.Accounts.Add(input);
-        await db.SaveChangesAsync();
-        return input;
-    }
-}
