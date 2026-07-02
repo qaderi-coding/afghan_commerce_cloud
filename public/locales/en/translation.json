@@ -1,0 +1,9 @@
+{
+  "welcome": "Afghan Commerce Cloud",
+  "login": "Login",
+  "username": "Username",
+  "password": "Password",
+  "submit": "Submit",
+  "required": "Required",
+  "invalid_credentials": "Invalid username or password"
+}
